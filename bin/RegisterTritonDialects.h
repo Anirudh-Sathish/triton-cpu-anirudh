@@ -17,6 +17,7 @@
 #include "cpu/include/TritonCPUToLLVM/Passes.h"
 #include "cpu/include/TritonCPUTransforms/Passes.h"
 #include "cpu/include/TritonToTritonCPU/Passes.h"
+#include "cpu/include/TritonToSCF/Passes.h"
 #include "nvidia/include/NVGPUToLLVM/Passes.h"
 #include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
@@ -67,6 +68,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::cpu::registerTritonToTritonCPUPasses();
   mlir::triton::cpu::registerTritonCPUTransformsPasses();
   mlir::triton::cpu::registerTritonCPUToLLVMPasses();
+  mlir::triton::cpu::registerTritonToSCFPasses();
 
   // TODO: register Triton & TritonGPU passes
   registry
