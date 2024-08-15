@@ -82,7 +82,43 @@ public:
   }
 };
 
+struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
+  using OpConversionPattern::OpConversionPattern;
 
+  LogicalResult
+  matchAndRewrite(triton::SplatOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    mlir::Value splatValue = adaptor.getSrc();  
+    auto resultType = op.getType();
+    int64_t resSize = 0;
+    llvm::ArrayRef<int64_t> resShape;
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(resultType)) {
+      resShape = shapedType.getShape();
+      resSize = resShape.size();
+    } else {
+      llvm::errs() << "Result type is not a ShapedType.\n";
+      return failure();
+    }
+
+    auto memrefType = MemRefType::get(resShape, splatValue.getType());  // Ensure the memref type matches the value type (i32)
+    auto alloc = rewriter.create<memref::AllocOp>(loc, memrefType);
+
+    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, resShape[0]);
+    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+
+    rewriter.create<scf::ForOp>(
+      loc, lowerBound, upperBound, step, ValueRange{}, 
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
+        nestedBuilder.create<memref::StoreOp>(loc, splatValue, alloc, iv);
+        nestedBuilder.create<scf::YieldOp>(loc);
+      }
+    );
+    rewriter.replaceOp(op, alloc.getResult());
+    return success();
+  }
+};
 struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -126,6 +162,7 @@ namespace{
     PtrConversionTarget convTarget(*context, typeConverter);
     RewritePatternSet patterns(context);
     patterns.add<MakeRangeOpConversion>(typeConverter, context);
+    patterns.add<SplatOpConversion>(typeConverter, context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
   }
