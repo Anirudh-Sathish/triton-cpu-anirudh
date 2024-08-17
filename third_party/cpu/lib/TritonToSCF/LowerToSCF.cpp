@@ -87,10 +87,17 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
 
   LogicalResult
   matchAndRewrite(triton::SplatOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
+                 ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    mlir::Value splatValue = adaptor.getSrc();  
+    auto splatValue = adaptor.getSrc(); 
+    auto splatType = splatValue.getType(); 
     auto resultType = op.getType();
+    mlir::Type pointee;
+    bool isPointer = false;
+     if (auto ptrType =dyn_cast<mlir::triton::PointerType>(splatType)) {
+      isPointer = true;
+      pointee = ptrType.getPointeeType();
+    }
     int64_t resSize = 0;
     llvm::ArrayRef<int64_t> resShape;
     if (auto shapedType = dyn_cast<mlir::ShapedType>(resultType)) {
@@ -100,25 +107,85 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
       llvm::errs() << "Result type is not a ShapedType.\n";
       return failure();
     }
-
-    auto memrefType = MemRefType::get(resShape, splatValue.getType());  // Ensure the memref type matches the value type (i32)
+    MemRefType memrefType;
+    if(isPointer)
+      memrefType = MemRefType::get(resShape, pointee);
+    else
+      memrefType = MemRefType::get(resShape, splatValue.getType());
     auto alloc = rewriter.create<memref::AllocOp>(loc, memrefType);
-
     auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, resShape[0]);
     auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-
     rewriter.create<scf::ForOp>(
-      loc, lowerBound, upperBound, step, ValueRange{}, 
+      loc, lowerBound, upperBound, step, ValueRange{},
       [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
-        nestedBuilder.create<memref::StoreOp>(loc, splatValue, alloc, iv);
+        if(isPointer){
+          auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, pointee, splatValue).getResult(0);
+          nestedBuilder.create<memref::StoreOp>(loc, cast, alloc, iv);
+        }
+        else{
+          nestedBuilder.create<memref::StoreOp>(loc, splatValue, alloc, iv);
+        }
         nestedBuilder.create<scf::YieldOp>(loc);
-      }
-    );
+        });
     rewriter.replaceOp(op, alloc.getResult());
     return success();
   }
 };
+
+
+struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::StoreOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    mlir::Value ptr = op.getPtr();
+    mlir::Value storedValue = op.getValue();
+    mlir::Type storedType = storedValue.getType();
+    mlir::Type ptrType = ptr.getType();
+    llvm::ArrayRef<int64_t> ptrShape;
+    mlir::Type pointeeType;
+    auto loc = op.getLoc();
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(storedType)) {
+      ptrShape = shapedType.getShape();
+    } else {
+      llvm::errs() << "Stored type is not a ShapedType.\n";
+      return failure();
+    }
+    if (auto tensorType = dyn_cast<RankedTensorType>(ptrType)) {
+      auto elemTy = tensorType.getElementType();
+      if (auto ptrType = dyn_cast<mlir::triton::PointerType>(elemTy)) {
+        pointeeType = ptrType.getPointeeType();
+      } else {
+        llvm::errs() << "elemTy is not a pointer\n";
+        return failure();
+      }
+    } else {
+      llvm::errs() << "Not Tensor Type\n";
+      return failure();
+    }
+    auto memrefType = MemRefType::get(ptrShape, pointeeType);
+    auto castValue = rewriter.create<UnrealizedConversionCastOp>(
+        loc, memrefType, storedValue);
+    auto castPtr = rewriter.create<UnrealizedConversionCastOp>(
+        loc, memrefType, ptr);
+    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto upperBound =rewriter.create<arith::ConstantIndexOp>(loc, ptrShape[0]);
+    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    rewriter.create<scf::ForOp>(
+      loc, lowerBound, upperBound, step, ValueRange{},
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
+        auto loadedPtr = nestedBuilder.create<memref::LoadOp>(loc, castPtr.getResult(0), iv);
+        nestedBuilder.create<memref::StoreOp>(loc,loadedPtr, castValue.getResult(0), iv);
+        nestedBuilder.create<scf::YieldOp>(loc);
+        });
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+
 struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -163,6 +230,7 @@ namespace{
     RewritePatternSet patterns(context);
     patterns.add<MakeRangeOpConversion>(typeConverter, context);
     patterns.add<SplatOpConversion>(typeConverter, context);
+    patterns.add<StoreOpConversion>(typeConverter, context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
   }
