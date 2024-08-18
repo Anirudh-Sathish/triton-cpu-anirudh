@@ -118,7 +118,7 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
     auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     rewriter.create<scf::ForOp>(
       loc, lowerBound, upperBound, step, ValueRange{},
-      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange ) {
         if(isPointer){
           auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, pointee, splatValue).getResult(0);
           nestedBuilder.create<memref::StoreOp>(loc, cast, alloc, iv);
@@ -132,6 +132,7 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
     return success();
   }
 };
+
 
 
 struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
@@ -175,12 +176,66 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
     auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     rewriter.create<scf::ForOp>(
       loc, lowerBound, upperBound, step, ValueRange{},
-      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange ) {
         auto loadedPtr = nestedBuilder.create<memref::LoadOp>(loc, castPtr.getResult(0), iv);
         nestedBuilder.create<memref::StoreOp>(loc,loadedPtr, castValue.getResult(0), iv);
         nestedBuilder.create<scf::YieldOp>(loc);
         });
     rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    mlir::Value ptr = op.getPtr();
+    mlir::Type resultType = op.getResult().getType();
+    mlir::Type ptrType = ptr.getType();
+    llvm::ArrayRef<int64_t> ptrShape;
+    mlir::Type pointeeType;
+    auto loc = op.getLoc();
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(resultType)) {
+      ptrShape = shapedType.getShape();
+    } else {
+      llvm::errs() << "Result type is not a ShapedType.\n";
+      return failure();
+    }
+
+    if (auto tensorType = dyn_cast<RankedTensorType>(ptrType)) {
+      auto elemTy = tensorType.getElementType();
+      if (auto ptrType = dyn_cast<mlir::triton::PointerType>(elemTy)) {
+        pointeeType = ptrType.getPointeeType();
+      } else {
+        llvm::errs() << "elemTy is not a pointer.\n";
+        return failure();
+      }
+    } else {
+      llvm::errs() << "Not a Tensor Type.\n";
+      return failure();
+    }
+    auto memrefType = MemRefType::get(ptrShape, pointeeType);
+    auto castPtr = rewriter.create<UnrealizedConversionCastOp>(
+        loc, memrefType, ptr);
+    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, ptrShape[0]);
+    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto alloc = rewriter.create<memref::AllocOp>(loc, memrefType);
+    rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, ValueRange{},
+        [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv,
+            ValueRange ) {
+          auto loadedValue = nestedBuilder.create<memref::LoadOp>(
+              loc, castPtr.getResult(0), iv);
+          nestedBuilder.create<memref::StoreOp>(loc, loadedValue,
+                                                alloc, iv);
+          nestedBuilder.create<scf::YieldOp>(loc);
+        });
+    rewriter.replaceOp(op, alloc.getResult());
+
     return success();
   }
 };
@@ -203,7 +258,7 @@ struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
     auto step = rewriter.create<arith::ConstantIndexOp>(op.getLoc(), 1);
     rewriter.create<scf::ForOp>(
       op.getLoc(), lowerBound, upperBound, step, ValueRange{}, 
-      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange /*args*/) {
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange ) {
         auto value = nestedBuilder.create<arith::ConstantIntOp>(loc, start, 64);
         auto increment = nestedBuilder.create<arith::IndexCastOp>(loc, nestedBuilder.getIntegerType(64), iv);
         auto finalValue = nestedBuilder.create<arith::AddIOp>(loc, value, increment);
@@ -230,6 +285,7 @@ namespace{
     RewritePatternSet patterns(context);
     patterns.add<MakeRangeOpConversion>(typeConverter, context);
     patterns.add<SplatOpConversion>(typeConverter, context);
+    patterns.add<LoadOpConversion>(typeConverter, context);
     patterns.add<StoreOpConversion>(typeConverter, context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
@@ -237,8 +293,6 @@ namespace{
 };
 
 }
-
-
 
 namespace mlir {
 namespace triton {
