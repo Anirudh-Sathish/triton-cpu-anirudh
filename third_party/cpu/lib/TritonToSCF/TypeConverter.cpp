@@ -10,6 +10,13 @@ TritonToSCFTypeConverter::TritonToSCFTypeConverter() {
   addConversion([](mlir::Type type) { return type; });
   // Converted ops produce vectors instead of tensors. Provide conversion
   // here for users.
+
+  addConversion([this](RankedTensorType tensorTy) -> Type {
+    Type elemTy = convertType(tensorTy.getElementType());
+    if (isa<triton::PointerType>(elemTy))
+      elemTy = IntegerType::get(tensorTy.getContext(), 64);
+    return VectorType::get(tensorTy.getShape(), elemTy);
+  });
   addSourceMaterialization([&](OpBuilder &builder, Type type, ValueRange inputs,
                                Location loc) -> std::optional<Value> {
     return builder.create<UnrealizedConversionCastOp>(loc, type, inputs)
