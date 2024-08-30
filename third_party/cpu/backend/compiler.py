@@ -85,7 +85,15 @@ class CPUBackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         pm.run(mod)
         return mod
-
+    
+    @staticmethod
+    def make_scf(mod,metadata,opt):
+        #TTIR -> SCF
+        pm = ir.pass_manager(mod.context)
+        pm.enable_debug()
+        cpu.passes.ttcpuir.lower_triton_to_scf(pm)
+        pm.run(mod)
+        return mod
     @staticmethod
     def make_ttcir(mod, metadata, opt):
         # TTIR -> TTCIR
@@ -209,6 +217,7 @@ class CPUBackend(BaseBackend):
 
     def add_stages(self, stages, options):
         stages["ttir"] = lambda src, metadata: self.make_ttir(src, metadata, options)
+        stages["scf"] = lambda src, metadata: self.make_scf(src,metadata,options)
         stages["ttcir"] = lambda src, metadata: self.make_ttcir(src, metadata, options)
         stages["tttcir"] = lambda src, metadata: self.make_tttcir(src, metadata, options)
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
