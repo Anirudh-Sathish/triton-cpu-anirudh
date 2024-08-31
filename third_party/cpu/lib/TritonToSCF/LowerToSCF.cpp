@@ -6,7 +6,7 @@ File to lower triton ir to scf
 #include "cpu/include/Analysis/TensorPtrShapeInfo.h"
 #include "cpu/include/TritonToSCF/Passes.h"
 #include "TypeConverter.h"
-
+#include "OpTypeConversion.h"
 
 #include "mlir/Analysis/DataFlowFramework.h"
 #include "mlir/Conversion/LLVMCommon/TypeConverter.h"
@@ -76,6 +76,14 @@ public:
     addLegalOp<mlir::UnrealizedConversionCastOp>();
     addLegalDialect<TritonCPUDialect>();
     addLegalDialect<vector::VectorDialect>();
+    addDynamicallyLegalDialect<math::MathDialect>(
+        [&](Operation *op) -> std::optional<bool> {
+          return converter.isLegal(op);
+        });
+    addDynamicallyLegalDialect<arith::ArithDialect>(
+        [&](Operation *op) -> std::optional<bool> {
+          return converter.isLegal(op);
+        });
 
     addDynamicallyLegalOp<triton::PtrToIntOp>(
         [](triton::PtrToIntOp op) { return op.getType().isInteger(); });
@@ -136,61 +144,6 @@ struct SplatOpConversion : public OpConversionPattern<triton::SplatOp> {
   }
 };
 
-struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    mlir::Value ptr = op.getPtr();
-    mlir::Type resultType = op.getResult().getType();
-    mlir::Type ptrType = ptr.getType();
-    llvm::ArrayRef<int64_t> ptrShape;
-    mlir::Type pointeeType;
-    auto loc = op.getLoc();
-    if (auto shapedType = dyn_cast<mlir::ShapedType>(resultType)) {
-      ptrShape = shapedType.getShape();
-    } else {
-      llvm::errs() << "Result type is not a ShapedType.\n";
-      return failure();
-    }
-
-    if (auto tensorType = dyn_cast<RankedTensorType>(ptrType)) {
-      auto elemTy = tensorType.getElementType();
-      if (auto ptrType = dyn_cast<mlir::triton::PointerType>(elemTy)) {
-        pointeeType = ptrType.getPointeeType();
-      } else {
-        llvm::errs() << "elemTy is not a pointer.\n";
-        return failure();
-      }
-    } else {
-      llvm::errs() << "Not a Tensor Type.\n";
-      return failure();
-    }
-    auto memrefType = MemRefType::get(ptrShape, pointeeType);
-    auto castPtr = rewriter.create<UnrealizedConversionCastOp>(
-        loc, memrefType, ptr);
-    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
-    auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, ptrShape[0]);
-    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
-    auto alloc = rewriter.create<memref::AllocOp>(loc, memrefType);
-    rewriter.create<scf::ForOp>(
-        loc, lowerBound, upperBound, step, ValueRange{},
-        [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv,
-            ValueRange ) {
-          auto loadedValue = nestedBuilder.create<memref::LoadOp>(
-              loc, castPtr.getResult(0), iv);
-          nestedBuilder.create<memref::StoreOp>(loc, loadedValue,
-                                                alloc, iv);
-          nestedBuilder.create<scf::YieldOp>(loc);
-        });
-    rewriter.replaceOp(op, alloc.getResult());
-
-    return success();
-  }
-};
-
-
 struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -220,6 +173,10 @@ struct MakeRangeOpConversion : public OpConversionPattern<triton::MakeRangeOp> {
   }
 };
 
+// This conversion pattern handles the transformation of `triton::StoreOp` operations.
+// It converts the Triton StoreOp to SCF dialect operations by first extracting the pointer
+// and value, converting the pointer to a MemRef type, and then storing the value into the 
+// MemRef using a loop. The original Triton StoreOp is erased and replaced with the new operations.
 struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
   using OpConversionPattern::OpConversionPattern;
 
@@ -245,13 +202,14 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
     }
     mlir::Type memRefTy = MemRefType::get(ptrShape, elemTy);
     mlir::Value memRef =rewriter.create<triton::cpu::PtrToMemRefOp>(loc, memRefTy, updatedPtr);
+    auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, memRefTy, vals).getResult(0);
     auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
     auto upperBound =rewriter.create<arith::ConstantIndexOp>(loc, ptrShape[0]);
     auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
     auto forOp = rewriter.create<scf::ForOp>(
       loc, lowerBound, upperBound, step, ValueRange{},
       [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange ) {
-        auto constantValue = rewriter.create<vector::ExtractOp>(loc, vals, 0);
+        auto constantValue = nestedBuilder.create<memref::LoadOp>(loc, cast, iv);
         nestedBuilder.create<memref::StoreOp>(loc,constantValue, memRef, iv);
         nestedBuilder.create<scf::YieldOp>(loc);
         });
@@ -260,7 +218,106 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
   }
 };
 
+// This conversion pattern handles the transformation of `triton::LoadOp` operations.
+// It converts the Triton LoadOp to SCF dialect operations by extracting the pointer, 
+// converting it to a MemRef type, and then loading the value from the MemRef. The result 
+// is cast to the appropriate vector type. The original Triton LoadOp is replaced with 
+// the new vector type loaded from memory.
+struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
+  using OpConversionPattern::OpConversionPattern;
 
+  LogicalResult
+  matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    mlir::Value ptrs = rewriter.getRemappedValue(op.getPtr());
+    llvm::ArrayRef<int64_t> ptrShape;
+    mlir::Type pointeeType;
+    mlir::Value ptr = rewriter.create<vector::ExtractOp>(loc, ptrs, 0);
+    auto tensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
+    auto ptrTy = tensorTy.getElementType();
+    auto updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
+    mlir::Type resTy = getTypeConverter()->convertType(ptrs.getType());
+    mlir::Type elemTy = updatedPtr.getType();
+    if (auto ptrType = dyn_cast<mlir::triton::PointerType>(elemTy)) {
+        pointeeType = ptrType.getPointeeType();
+      }
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(ptrs.getType())) {
+      ptrShape = shapedType.getShape();
+    }
+    mlir::Type memRefTy = MemRefType::get(ptrShape, pointeeType);
+    mlir::Value memRef =rewriter.create<triton::cpu::PtrToMemRefOp>(loc, memRefTy, updatedPtr);
+    auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
+    auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, tensorResultType, memRef).getResult(0);
+    rewriter.replaceOp(op, cast);
+    return success();
+  }
+};
+
+// This conversion pattern handles the transformation of `arith::ConstantOp` operations.
+// It converts constant values defined in tensor form into memory reference allocations. 
+// The pattern creates a memory allocation, initializes it with the constant values using 
+// an scf loop, and then converts the allocated memory reference to a vector type. The original 
+// arith::ConstantOp is replaced with the new vector type initialized with constants.
+struct ConstantOpConversion : public OpConversionPattern<arith::ConstantOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::ConstantOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    assert(isa<RankedTensorType>(op.getType()));
+    llvm::ArrayRef<int64_t> shape;
+    auto resTy =
+        dyn_cast<mlir::VectorType>(getTypeConverter()->convertType(op.getType()));
+    assert(resTy);
+    auto loc = op.getLoc();
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(op.getType())) {
+      shape = shapedType.getShape();
+    }
+    auto elemTy = resTy.getElementType();
+    if (auto denseAttr = dyn_cast<DenseElementsAttr>(op.getValueAttr())) {
+      auto memrefType = MemRefType::get(shape, elemTy);
+      auto alloc = rewriter.create<memref::AllocOp>(loc,memrefType);
+      auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      auto upperBound =rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
+      auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      auto splatType = denseAttr.getElementType();
+      mlir::Value newCst;
+      if (splatType.isF32()) {
+        if (auto splatValue = denseAttr.getSplatValue<float>()) {
+            newCst = rewriter.create<arith::ConstantOp>(loc,
+            rewriter.getF32Type(),
+            rewriter.getF32FloatAttr(splatValue));
+        } else {
+            llvm::errs() << "No splat value (float)\n";
+        }     
+      }else if (splatType.isF64()) {
+        if (auto splatValue = denseAttr.getSplatValue<double>()) {
+            newCst = rewriter.create<arith::ConstantOp>(loc,
+            rewriter.getF64Type(),
+            rewriter.getF64FloatAttr(splatValue));
+        } else {
+            llvm::errs() << "No splat value (float)\n";
+        }     
+      }
+      else {
+          llvm::errs() << "Unsupported element type\n";
+      }
+      auto forOp = rewriter.create<scf::ForOp>(
+      loc, lowerBound, upperBound, step, ValueRange{},
+      [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv, ValueRange ) {
+        nestedBuilder.create<memref::StoreOp>(loc,newCst, alloc, iv);
+        nestedBuilder.create<scf::YieldOp>(loc);
+        });
+      auto vecType = mlir::VectorType::get(shape, elemTy);
+      auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, vecType, alloc.getResult()).getResult(0);
+      rewriter.replaceOp(op, cast);
+    } else {
+      llvm_unreachable("Unexpected constant attribute");
+    }
+    return success();
+  }
+};
 
 namespace{
     struct LowerTritonToSCF
@@ -277,8 +334,11 @@ namespace{
     RewritePatternSet patterns(context);
     // patterns.add<MakeRangeOpConversion>(typeConverter, context);
     // patterns.add<SplatOpConversion>(typeConverter, context);
-    // patterns.add<LoadOpConversion>(typeConverter, context);
+    patterns.add<LoadOpConversion>(typeConverter, context);
     patterns.add<StoreOpConversion>(typeConverter, context);
+    patterns.add<OpTypeConversion<arith::AddIOp>>(typeConverter, context);
+    patterns.add<ConstantOpConversion>(typeConverter, context);
+    // patterns.add<LowerAddiOpPattern>(typeConverter,context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
   }
