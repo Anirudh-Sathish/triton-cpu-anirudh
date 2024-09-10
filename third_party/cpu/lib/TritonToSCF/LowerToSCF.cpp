@@ -276,36 +276,61 @@ struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
     mlir::Value ptrs = rewriter.getRemappedValue(op.getPtr());
     llvm::ArrayRef<int64_t> ptrShape;
     mlir::Type pointeeType;
-    mlir::Value updatedPtr;
+    mlir::Value updatedPtr, row, ptr, memRef, newIdx, zeroIdx;
     auto tensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
     auto ptrTy = tensorTy.getElementType();
+    if (auto elemType = dyn_cast<mlir::triton::PointerType>(ptrTy)) {
+      pointeeType = elemType.getPointeeType();
+    }
     mlir::Type resTy = getTypeConverter()->convertType(ptrs.getType());
     if (auto shapedType = dyn_cast<mlir::ShapedType>(ptrs.getType())) {
       ptrShape = shapedType.getShape();
     }
+    auto memRefTy = MemRefType::get(ptrShape, pointeeType);
     if (ptrShape.size() == 2) {
-      mlir::Value row = rewriter.create<vector::ExtractOp>(loc, ptrs, 0);
-      mlir::Value ptr = rewriter.create<vector::ExtractOp>(loc, row, 0);
-      updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
+      auto alloc = rewriter.create<memref::AllocOp>(loc, memRefTy);
+      auto lowerBound1 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      auto upperBound1 =
+          rewriter.create<arith::ConstantIndexOp>(loc, ptrShape[1]);
+      auto step1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      for (int i = 0; i < ptrShape[0]; i++) {
+        row = rewriter.create<vector::ExtractOp>(loc, ptrs, i);
+        ptr = rewriter.create<vector::ExtractOp>(loc, row, 0);
+        updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
+        memRef = rewriter.create<triton::cpu::PtrToMemRefOp>(loc, memRefTy,
+                                                             updatedPtr);
+        rewriter.create<scf::ForOp>(
+            loc, lowerBound1, upperBound1, step1, ValueRange{},
+            [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv1,
+                ValueRange) {
+              newIdx = rewriter.create<arith::ConstantIndexOp>(loc, i);
+              zeroIdx = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+              auto value = nestedBuilder.create<memref::LoadOp>(
+                  loc, memRef, ValueRange{zeroIdx, iv1});
+              nestedBuilder.create<memref::StoreOp>(loc, value, alloc,
+                                                    ValueRange{newIdx, iv1});
+              nestedBuilder.create<scf::YieldOp>(loc);
+            });
+      }
+      auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
+      auto cast = rewriter
+                      .create<UnrealizedConversionCastOp>(loc, tensorResultType,
+                                                          alloc.getResult())
+                      .getResult(0);
+      rewriter.replaceOp(op, cast);
     } else {
       mlir::Value ptr = rewriter.create<vector::ExtractOp>(loc, ptrs, 0);
       updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
+      mlir::Value memRef = rewriter.create<triton::cpu::PtrToMemRefOp>(
+          loc, memRefTy, updatedPtr);
+      auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
+      auto cast =
+          rewriter
+              .create<UnrealizedConversionCastOp>(loc, tensorResultType, memRef)
+              .getResult(0);
+      rewriter.replaceOp(op, cast);
     }
 
-    mlir::Type elemTy = updatedPtr.getType();
-    if (auto ptrType = dyn_cast<mlir::triton::PointerType>(elemTy)) {
-      pointeeType = ptrType.getPointeeType();
-    }
-
-    mlir::Type memRefTy = MemRefType::get(ptrShape, pointeeType);
-    mlir::Value memRef =
-        rewriter.create<triton::cpu::PtrToMemRefOp>(loc, memRefTy, updatedPtr);
-    auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
-    auto cast =
-        rewriter
-            .create<UnrealizedConversionCastOp>(loc, tensorResultType, memRef)
-            .getResult(0);
-    rewriter.replaceOp(op, cast);
     return success();
   }
 };
