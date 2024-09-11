@@ -312,9 +312,9 @@ struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
               nestedBuilder.create<scf::YieldOp>(loc);
             });
       }
-      auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
+      auto vectorResultType = mlir::VectorType::get(ptrShape, pointeeType);
       auto cast = rewriter
-                      .create<UnrealizedConversionCastOp>(loc, tensorResultType,
+                      .create<UnrealizedConversionCastOp>(loc, vectorResultType,
                                                           alloc.getResult())
                       .getResult(0);
       rewriter.replaceOp(op, cast);
@@ -323,10 +323,10 @@ struct LoadOpConversion : public OpConversionPattern<triton::LoadOp> {
       updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
       mlir::Value memRef = rewriter.create<triton::cpu::PtrToMemRefOp>(
           loc, memRefTy, updatedPtr);
-      auto tensorResultType = mlir::VectorType::get(ptrShape, pointeeType);
+      auto vectorResultType = mlir::VectorType::get(ptrShape, pointeeType);
       auto cast =
           rewriter
-              .create<UnrealizedConversionCastOp>(loc, tensorResultType, memRef)
+              .create<UnrealizedConversionCastOp>(loc, vectorResultType, memRef)
               .getResult(0);
       rewriter.replaceOp(op, cast);
     }
@@ -456,6 +456,59 @@ struct ConstantOpConversion : public OpConversionPattern<arith::ConstantOp> {
   }
 };
 
+// This pattern converts `arith::AddFOp` from tensor operands to memref
+// allocations. It allocates memory, performs element-wise addition using a
+// loop, stores the result, and casts the allocated memory to a vector type
+// before replacing the original operation.
+struct AddOpConversion : public OpConversionPattern<arith::AddFOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::AddFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto lhs = rewriter.getRemappedValue(op.getLhs());
+    auto rhs = rewriter.getRemappedValue(op.getRhs());
+    auto tensorTy = dyn_cast<RankedTensorType>(op.getLhs().getType());
+    auto ptrTy = tensorTy.getElementType();
+    llvm::ArrayRef<int64_t> shape;
+    if (auto shapedType = dyn_cast<mlir::ShapedType>(op.getLhs().getType())) {
+      shape = shapedType.getShape();
+    }
+    auto memRefTy = MemRefType::get(shape, ptrTy);
+    auto alloc = rewriter.create<memref::AllocOp>(loc, memRefTy);
+    auto castLhs =
+        rewriter.create<UnrealizedConversionCastOp>(loc, memRefTy, lhs)
+            .getResult(0);
+    auto castRhs =
+        rewriter.create<UnrealizedConversionCastOp>(loc, memRefTy, rhs)
+            .getResult(0);
+    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, shape[0]);
+    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, ValueRange{},
+        [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv,
+            ValueRange) {
+          auto constantLhs =
+              nestedBuilder.create<memref::LoadOp>(loc, castLhs, iv);
+          auto constantRhs =
+              nestedBuilder.create<memref::LoadOp>(loc, castRhs, iv);
+          auto summationValue = nestedBuilder.create<arith::AddFOp>(
+              loc, constantLhs, constantRhs);
+          nestedBuilder.create<memref::StoreOp>(loc, summationValue, alloc, iv);
+          nestedBuilder.create<scf::YieldOp>(loc);
+        });
+    auto vectorResultType = mlir::VectorType::get(shape, ptrTy);
+    auto cast = rewriter
+                    .create<UnrealizedConversionCastOp>(loc, vectorResultType,
+                                                        alloc.getResult())
+                    .getResult(0);
+    rewriter.replaceOp(op, cast);
+    return success();
+  }
+};
+
 namespace {
 struct LowerTritonToSCF
     : public triton::impl::LowerTritonToSCFBase<LowerTritonToSCF> {
@@ -471,12 +524,15 @@ struct LowerTritonToSCF
     RewritePatternSet patterns(context);
     // patterns.add<MakeRangeOpConversion>(typeConverter, context);
     // patterns.add<SplatOpConversion>(typeConverter, context);
+    patterns.add<AddOpConversion>(typeConverter, context);
     patterns.add<LoadOpConversion>(typeConverter, context);
     patterns.add<StoreOpConversion>(typeConverter, context);
     patterns.add<OpTypeConversion<arith::AddIOp>>(typeConverter, context);
     patterns.add<ConstantOpConversion>(typeConverter, context);
     patterns.add<OpTypeConversion<arith::MulFOp>>(typeConverter, context);
     patterns.add<OpTypeConversion<arith::MulIOp>>(typeConverter, context);
+    patterns.add<OpTypeConversion<arith::CmpFOp>>(typeConverter, context);
+    patterns.add<OpTypeConversion<arith::CmpIOp>>(typeConverter, context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
   }
