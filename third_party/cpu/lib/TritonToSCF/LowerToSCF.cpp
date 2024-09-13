@@ -373,21 +373,15 @@ struct ConstantOpConversion : public OpConversionPattern<arith::ConstantOp> {
           auto splatType = denseAttr.getElementType();
           mlir::Value newCst;
           if (splatType.isF32()) {
-            if (auto splatValue = denseAttr.getSplatValue<float>()) {
-              newCst = rewriter.create<arith::ConstantOp>(
-                  loc, rewriter.getF32Type(),
-                  rewriter.getF32FloatAttr(splatValue));
-            } else {
-              llvm::errs() << "No splat value (float)\n";
-            }
+            auto splatValue = denseAttr.getSplatValue<float>();
+            newCst = rewriter.create<arith::ConstantOp>(
+                loc, rewriter.getF32Type(),
+                rewriter.getF32FloatAttr(splatValue));
           } else if (splatType.isF64()) {
-            if (auto splatValue = denseAttr.getSplatValue<double>()) {
-              newCst = rewriter.create<arith::ConstantOp>(
-                  loc, rewriter.getF64Type(),
-                  rewriter.getF64FloatAttr(splatValue));
-            } else {
-              llvm::errs() << "No splat value (float)\n";
-            }
+            auto splatValue = denseAttr.getSplatValue<double>();
+            newCst = rewriter.create<arith::ConstantOp>(
+                loc, rewriter.getF64Type(),
+                rewriter.getF64FloatAttr(splatValue));
           } else {
             llvm::errs() << "Unsupported element type\n";
           }
@@ -416,21 +410,13 @@ struct ConstantOpConversion : public OpConversionPattern<arith::ConstantOp> {
         auto splatType = denseAttr.getElementType();
         mlir::Value newCst;
         if (splatType.isF32()) {
-          if (auto splatValue = denseAttr.getSplatValue<float>()) {
-            newCst = rewriter.create<arith::ConstantOp>(
-                loc, rewriter.getF32Type(),
-                rewriter.getF32FloatAttr(splatValue));
-          } else {
-            llvm::errs() << "No splat value (float)\n";
-          }
+          auto splatValue = denseAttr.getSplatValue<float>();
+          newCst = rewriter.create<arith::ConstantOp>(
+              loc, rewriter.getF32Type(), rewriter.getF32FloatAttr(splatValue));
         } else if (splatType.isF64()) {
-          if (auto splatValue = denseAttr.getSplatValue<double>()) {
-            newCst = rewriter.create<arith::ConstantOp>(
-                loc, rewriter.getF64Type(),
-                rewriter.getF64FloatAttr(splatValue));
-          } else {
-            llvm::errs() << "No splat value (float)\n";
-          }
+          auto splatValue = denseAttr.getSplatValue<double>();
+          newCst = rewriter.create<arith::ConstantOp>(
+              loc, rewriter.getF64Type(), rewriter.getF64FloatAttr(splatValue));
         } else {
           llvm::errs() << "Unsupported element type\n";
         }
@@ -509,6 +495,50 @@ struct AddOpConversion : public OpConversionPattern<arith::AddFOp> {
   }
 };
 
+// `ReductionOpConversion` lowers `triton::ReduceOp` to an SCF loop for
+// reduction. It converts the input tensor to a `MemRefType`, and sets up an SCF
+// `for` loop that iterates over the reduction dimension (set to 0). The loop
+// accumulates the sum of the tensor's elements using `memref::LoadOp` and
+// `arith::AddFOp`, yielding the result at the end.
+struct ReductionOpConversion : public OpConversionPattern<triton::ReduceOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = op.getLoc();
+    auto src = rewriter.getRemappedValue(op.getOperand(0));
+    auto tensorTy = dyn_cast<RankedTensorType>(op.getOperand(0).getType());
+    if (!tensorTy)
+      return failure();
+    auto ptrTy = tensorTy.getElementType();
+    llvm::ArrayRef<int64_t> shape = tensorTy.getShape();
+    auto memRefTy = MemRefType::get(shape, ptrTy);
+    auto cast = rewriter.create<UnrealizedConversionCastOp>(loc, memRefTy, src)
+                    .getResult(0);
+
+    int64_t reduceDim = 0;
+    int64_t reduceSize = shape[reduceDim];
+    auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    auto upperBound = rewriter.create<arith::ConstantIndexOp>(loc, reduceSize);
+    auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    mlir::Value sumInit =
+        rewriter.create<arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0));
+    auto forOp = rewriter.create<scf::ForOp>(
+        loc, lowerBound, upperBound, step, sumInit,
+        [&](OpBuilder &builder, Location loc, mlir::Value iv,
+            mlir::ValueRange iterArgs) {
+          mlir::Value sum = iterArgs[0];
+          auto loadValue = builder.create<memref::LoadOp>(loc, cast, iv);
+          mlir::Value updatedSum =
+              builder.create<arith::AddFOp>(loc, sum, loadValue);
+          builder.create<scf::YieldOp>(loc, ValueRange{updatedSum});
+        });
+    rewriter.replaceOp(op, forOp.getResult(0));
+    return success();
+  }
+};
+
 namespace {
 struct LowerTritonToSCF
     : public triton::impl::LowerTritonToSCFBase<LowerTritonToSCF> {
@@ -533,6 +563,7 @@ struct LowerTritonToSCF
     patterns.add<OpTypeConversion<arith::MulIOp>>(typeConverter, context);
     patterns.add<OpTypeConversion<arith::CmpFOp>>(typeConverter, context);
     patterns.add<OpTypeConversion<arith::CmpIOp>>(typeConverter, context);
+    patterns.add<ReductionOpConversion>(typeConverter, context);
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
       return signalPassFailure();
   }
