@@ -192,7 +192,32 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
     auto ptrs = rewriter.getRemappedValue(op.getPtr());
     auto vals = rewriter.getRemappedValue(op.getValue());
     llvm::ArrayRef<int64_t> ptrShape;
-    auto tensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
+    RankedTensorType tensorTy;
+
+    // handle pointer type
+    if (auto ttPtrType = dyn_cast<triton::PointerType>(op.getPtr().getType())) {
+      SmallVector<int64_t, 1> elemShape(1, 1);
+      auto elemTy = ttPtrType.getPointeeType();
+      auto memRefTy = MemRefType::get(elemShape, elemTy);
+      auto memRef =
+          rewriter.create<triton::cpu::PtrToMemRefOp>(loc, memRefTy, ptrs);
+      auto lowerBound = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+      auto upperBound =
+          rewriter.create<arith::ConstantIndexOp>(loc, elemShape[0]);
+      auto step = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+      auto forOp = rewriter.create<scf::ForOp>(
+          loc, lowerBound, upperBound, step, ValueRange{},
+          [&](OpBuilder &nestedBuilder, Location loc, mlir::Value iv,
+              ValueRange) {
+            nestedBuilder.create<memref::StoreOp>(loc, vals, memRef, iv);
+            nestedBuilder.create<scf::YieldOp>(loc);
+          });
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    // handle tensor and shape types
+    tensorTy = dyn_cast<RankedTensorType>(op.getPtr().getType());
     auto ptrTy = tensorTy.getElementType();
     mlir::Type resTy = getTypeConverter()->convertType(vals.getType());
     mlir::Type elemTy;
@@ -202,6 +227,7 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
     if (auto shapedType = dyn_cast<mlir::ShapedType>(vals.getType())) {
       ptrShape = shapedType.getShape();
     }
+    // handle 2D shapes
     if (ptrShape.size() == 2) {
       mlir::Value row, ptr, updatedPtr, memRef, newIdx, zeroIdx;
       mlir::Type memRefTy = MemRefType::get(ptrShape, elemTy);
@@ -231,7 +257,7 @@ struct StoreOpConversion : public OpConversionPattern<triton::StoreOp> {
               nestedBuilder.create<scf::YieldOp>(loc);
             });
       }
-    } else {
+    } else { // handle 1D shapes
       mlir::Value ptr = rewriter.create<vector::ExtractOp>(loc, ptrs, 0);
       auto updatedPtr = rewriter.create<IntToPtrOp>(loc, ptrTy, ptr);
       mlir::Type memRefTy = MemRefType::get(ptrShape, elemTy);
