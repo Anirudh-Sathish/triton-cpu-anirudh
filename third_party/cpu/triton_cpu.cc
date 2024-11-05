@@ -1,6 +1,7 @@
 #include "TritonCPUToLLVM/Passes.h"
 #include "TritonCPUTransforms/Passes.h"
 #include "TritonToTritonCPU/Passes.h"
+#include "TritonToSCF/Passes.h"
 
 #include "triton/Dialect/TritonCPU/IR/Dialect.h"
 
@@ -93,6 +94,9 @@ void init_triton_cpu_passes_ttcpuir(py::module &&m) {
   });
   m.def("add_atomic_ops_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createAtomicOpsToLLVMPass());
+  });
+  m.def("lower_triton_to_scf",[](mlir::PassManager &pm){
+    pm.addPass(mlir::triton::cpu::createLowerTritonToSCF());
   });
   m.def("add_debug_ops_to_llvmir", [](mlir::PassManager &pm) {
     pm.addPass(mlir::triton::cpu::createDebugOpsToLLVMPass());
